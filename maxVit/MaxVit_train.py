@@ -11,77 +11,137 @@ from torchvision.models import maxvit_t, MaxVit_T_Weights
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import argparse
+import kornia
+import kornia.augmentation as K
+import gc  # 添加垃圾回收
+import numpy as np
+import warnings
+
+# 忽略PIL的EXIF警告
+warnings.filterwarnings("ignore", "(Possibly )?corrupt EXIF data", UserWarning)
 
 # 设置设备和优化
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
 
-# 自定义图片缩放变换 - 保持宽高比，填充而不是裁切
-class ResizeWithPad:
-    def __init__(self, target_size):
-        if isinstance(target_size, int):
-            self.target_size = (target_size, target_size)
+class RandomChunkDataset(Dataset):
+    def __init__(self, data_folder, batch_size=256, shuffle_samples=False, chunk_indices=None):
+        self.data_folder = data_folder
+        self.batch_size = batch_size
+        self.shuffle_samples = shuffle_samples
+        self.images_chunk_dir = os.path.join(data_folder, 'images_chunks')
+        self.scores_chunk_dir = os.path.join(data_folder, 'scores_chunks')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 加载元数据
+        metadata_path = os.path.join(data_folder, 'metadata.json')
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        with open(metadata_path, 'r') as f:
+            self.metadata = json.load(f)
+        
+        self.num_chunks = self.metadata['num_chunks']
+        
+        # 获取分块文件，限定 chunk_indices（用于训练/验证划分）
+        self.chunk_files = []
+        self.chunk_batch_info = []
+        total_batches = 0
+        
+        indices = chunk_indices if chunk_indices is not None else range(self.num_chunks)
+        for i in indices:
+            images_file = os.path.join(self.images_chunk_dir, f'images_chunk_{i:04d}.pt')
+            scores_file = os.path.join(self.scores_chunk_dir, f'scores_chunk_{i:04d}.pt')
+            if os.path.exists(images_file) and os.path.exists(scores_file):
+                try:
+                    chunk_size = torch.load(images_file, map_location='cpu', weights_only=True).size(0)
+                    batches_in_chunk = (chunk_size + self.batch_size - 1) // self.batch_size
+                    
+                    self.chunk_files.append({
+                        'images_path': images_file,
+                        'scores_path': scores_file,
+                        'idx': i,
+                        'size': chunk_size,
+                        'batches': batches_in_chunk
+                    })
+                    
+                    for batch_idx in range(batches_in_chunk):
+                        self.chunk_batch_info.append({
+                            'chunk_idx': len(self.chunk_files) - 1,  # 映射到 chunk_files 索引
+                            'batch_idx': batch_idx
+                        })
+                    
+                    total_batches += batches_in_chunk
+                except Exception as e:
+                    print(f"Error loading chunk {i}: {e}")
+                    continue
+            else:
+                print(f"Chunk {i} files missing: {images_file} or {scores_file}")
+        
+        if not self.chunk_files:
+            raise ValueError("No valid chunks found")
+        
+        self.total_batches = total_batches
+        self.current_chunk_idx = -1
+        self.current_images = None
+        self.current_scores = None
+        self.current_chunk_size = 0
+        self.current_indices = None
+        
+        print(f"Loaded {self.metadata['total_samples']} total samples from {len(self.chunk_files)} chunks")
+        print(f"Total batches: {self.total_batches}, Batch size: {self.batch_size}")
+
+    def __len__(self):
+        return self.total_batches
+
+    def __getitem__(self, idx):
+        if idx >= self.total_batches:
+            raise IndexError(f"Batch index {idx} out of range, total batches: {self.total_batches}")
+        
+        batch_info = self.chunk_batch_info[idx]
+        chunk_idx = batch_info['chunk_idx']
+        batch_idx = batch_info['batch_idx']
+        
+        if chunk_idx != self.current_chunk_idx:
+            self._load_chunk(chunk_idx)
+        
+        start_idx = batch_idx * self.batch_size
+        end_idx = min((batch_idx + 1) * self.batch_size, self.current_chunk_size)
+        
+        batch_indices = self.current_indices[start_idx:end_idx]
+        batch_images = self.current_images[batch_indices].to(self.device, non_blocking=True)
+        batch_scores = self.current_scores[batch_indices].to(self.device, non_blocking=True)
+        
+        return batch_images, batch_scores
+
+    def _load_chunk(self, chunk_idx):
+        """加载指定的数据块并优化内存管理"""
+        if self.current_images is not None:
+            del self.current_images
+            del self.current_scores
+            del self.current_indices
+            gc.collect()
+            torch.cuda.empty_cache()
+        
+        chunk_info = self.chunk_files[chunk_idx]
+        try:
+            images_cpu = torch.load(chunk_info['images_path'], map_location='cpu', weights_only=True)
+            scores_cpu = torch.load(chunk_info['scores_path'], map_location='cpu', weights_only=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load chunk {chunk_idx}: {e}")
+        
+        self.current_chunk_idx = chunk_idx
+        self.current_chunk_size = chunk_info['size']
+        self.current_images = images_cpu.float()
+        self.current_scores = scores_cpu.float()
+        
+        if self.shuffle_samples:
+            self.current_indices = np.random.permutation(self.current_chunk_size)
         else:
-            self.target_size = target_size
+            self.current_indices = np.arange(self.current_chunk_size)
+        
+        print(f"Loaded chunk {chunk_idx} with {self.current_chunk_size} samples")
 
-    def __call__(self, img):
-        # 获取原始图片尺寸
-        w, h = img.size
-        target_w, target_h = self.target_size
-        
-        # 计算缩放比例，保持宽高比
-        scale = min(target_w / w, target_h / h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        
-        # 缩放图片
-        img = img.resize((new_w, new_h), Image.BILINEAR)
-        
-        # 计算填充
-        delta_w = target_w - new_w
-        delta_h = target_h - new_h
-        padding = (delta_w // 2, delta_h // 2, delta_w - delta_w // 2, delta_h - delta_h // 2)
-        
-        # 填充图片（使用黑色填充）
-        img = transforms.Pad(padding, fill=(0, 0, 0))(img)
-        
-        return img
-
-# 自定义随机缩放裁切变换 - 保持宽高比
-class RandomResizeWithPad:
-    def __init__(self, target_size, scale=(0.8, 1.0)):
-        if isinstance(target_size, int):
-            self.target_size = (target_size, target_size)
-        else:
-            self.target_size = target_size
-        self.scale = scale
-
-    def __call__(self, img):
-        # 随机选择缩放比例
-        scale_factor = random.uniform(self.scale[0], self.scale[1])
-        
-        # 获取原始图片尺寸
-        w, h = img.size
-        target_w, target_h = self.target_size
-        
-        # 计算缩放后的尺寸
-        scaled_w = int(w * scale_factor)
-        scaled_h = int(h * scale_factor)
-        
-        # 按比例缩放图片
-        img = img.resize((scaled_w, scaled_h), Image.BILINEAR)
-        
-        # 计算填充
-        delta_w = target_w - scaled_w
-        delta_h = target_h - scaled_h
-        padding = (delta_w // 2, delta_h // 2, delta_w - delta_w // 2, delta_h - delta_h // 2)
-        
-        # 填充图片（使用黑色填充）
-        img = transforms.Pad(padding, fill=(0, 0, 0))(img)
-        
-        return img
-
-# 自定义数据集
+# 自定义数据集（用于验证集）
 class ImageScoreDataset(Dataset):
     def __init__(self, image_paths, scores, transform=None):
         self.image_paths = image_paths
@@ -94,16 +154,39 @@ class ImageScoreDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         try:
+            # 修复EXIF问题
             image = Image.open(img_path).convert("RGB")
+            image.load()  # 强制加载图像数据
         except Exception as e:
             print(f"Error loading image {img_path}: {e}")
-            # 返回一个空白图像作为占位符
             image = Image.new("RGB", (224, 224), (0, 0, 0))
         
         score = self.scores[idx]
         if self.transform:
             image = self.transform(image)
         return image, torch.tensor(score, dtype=torch.float32)
+
+def create_chunk_data_loader(data_folder, batch_size=512, shuffle_samples=False, chunk_indices=None):
+    dataset = RandomChunkDataset(
+        data_folder, 
+        batch_size=batch_size,
+        shuffle_samples=shuffle_samples,
+        chunk_indices=chunk_indices
+    )
+    
+    def chunk_collate_fn(batch):
+        images, scores = batch[0]
+        return images, scores  # 数据已在 __getitem__ 中转移到 GPU
+    
+    data_loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=chunk_collate_fn
+    )
+    
+    return data_loader, dataset
 
 # 检查并加载单个文件夹中的数据
 def load_single_folder_data(folder_path):
@@ -165,162 +248,95 @@ def create_transforms(augmentations, is_train=True):
     transform_list = []
     
     if is_train:
-        if 'resize' in augmentations:
-            transform_list.append(RandomResizeWithPad(224, scale=(0.8, 1.0)))
-        else:
-            transform_list.append(ResizeWithPad(224))
-        
-        if 'flip' in augmentations:
-            transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
-        
-        if 'rotation' in augmentations:
-            transform_list.append(transforms.RandomRotation(15))
-        
-        if 'jitter' in augmentations:
-            transform_list.append(transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1))
-    
+        # 基础变换
+        transform_list.append(transforms.Resize((224, 224)))
     else:
-        # Validation set: basic transforms
-        transform_list.append(ResizeWithPad(224))
+        # 验证集：基础变换
+        transform_list.append(transforms.Resize((224, 224)))
     
-    # Convert to tensor before applying GaussianNoise
+    # 转换为张量
     transform_list.append(transforms.ToTensor())
     
-    # Apply GaussianNoise after ToTensor if specified
-    if is_train and 'noise' in augmentations:
-        transform_list.append(GaussianNoise(0, 0.1))
-    
-    # Normalize after all transformations
+    # 标准化
     transform_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
     
     return transforms.Compose(transform_list)
 
-class GaussianNoise:
-    def __init__(self, mean=0., std=0.1):
-        self.std = std
-        self.mean = mean
-
-    def __call__(self, img):
-        # Check if input is a PIL Image and convert to tensor if necessary
-        if isinstance(img, Image.Image):
-            img = transforms.ToTensor()(img)
-        
-        # Ensure tensor is float32, but do not move to device
-        img = img.to(dtype=torch.float32)
-        
-        # Generate noise with the same shape as the input
-        noise = torch.randn_like(img) * self.std + self.mean
-        
-        # Add noise and clamp to [0, 1]
-        return torch.clamp(img + noise, 0, 1)
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(mean={self.mean}, std={self.std})"
-     
-# 模型定义
+# 优化的MaxVitRegressor模型
 class MaxVitRegressor(nn.Module):
     def __init__(self):
         super(MaxVitRegressor, self).__init__()
         # 加载预训练 MaxViT-Tiny
         self.backbone = maxvit_t(weights=MaxVit_T_Weights.DEFAULT)
         
-        # 检查模型结构
-        print("Original classifier:", self.backbone.classifier)
+        # 冻结早期层以减少计算量
+        for name, param in self.backbone.named_parameters():
+            if 'layers.0.' in name or 'layers.1.' in name or 'stem.' in name:  # 冻结stem和前两层
+                param.requires_grad = False
         
         # 移除原始分类器，获取特征提取器
-        # MaxViT的classifier通常是: [AdaptiveAvgPool2d, Flatten, Linear]
-        # 我们需要保留前面的部分，只移除最后的分类层
         self.backbone.classifier = nn.Identity()  # 完全移除分类器
         
-        # 添加全局平均池化
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        # 将backbone移动到设备上
+        self.backbone = self.backbone.to(device)
         
-        # 动态获取特征维度
+        # 动态获取特征维度 - 在正确的设备上创建测试输入
         with torch.no_grad():
-            test_input = torch.randn(1, 3, 224, 224)
+            test_input = torch.randn(1, 3, 224, 224).to(device)
             features = self.backbone(test_input)
-            print(f"Backbone output shape: {features.shape}")
-            
-            # 应用全局池化
-            pooled = self.global_pool(features)
-            print(f"Pooled shape: {pooled.shape}")
-            
-            feature_dim = pooled.shape[1]  # 获取通道数
+            feature_dim = features.shape[1]  # 获取通道数
+            print(f"Feature dimension: {feature_dim}")
         
-        self.regressor = nn.Linear(feature_dim, 1)
+        # 重新定义分类器为回归层
+        self.regressor = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(feature_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),  # 减少过拟合
+            nn.Linear(512, 1)
+        ).to(device)  # 确保回归器也在正确的设备上
 
     def forward(self, x):
         features = self.backbone(x)
-        # features现在是4D张量 (B, C, H, W)，需要池化到 (B, C, 1, 1)
-        features = self.global_pool(features)
-        # 展平到 (B, C)
-        features = torch.flatten(features, 1)
         # 应用回归层
         return self.regressor(features).squeeze(1)
 
-# 主函数
-def main(root_folder, save_path, augmentations, epochs=50, batch_size=32, lr=1e-3):
-    # 检查根文件夹是否存在
-    if not os.path.exists(root_folder):
-        raise FileNotFoundError(f"Root folder does not exist: {root_folder}")
-    
-    # 创建保存路径
+def train_model(data_folder, save_path, epochs=50, lr=1e-3, val_split=0.2):
     os.makedirs(save_path, exist_ok=True)
     
-    # 加载所有数据
-    image_paths, scores = load_all_data(root_folder)
+    if not os.path.exists(data_folder):
+        raise FileNotFoundError(f"Data folder does not exist: {data_folder}")
     
-    if len(image_paths) == 0:
-        raise ValueError("No images found or no matching scores in JSON files")
+    # 加载元数据以获取 chunk 总数
+    metadata_path = os.path.join(data_folder, 'metadata.json')
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    num_chunks = metadata['num_chunks']
     
-    # 创建训练和验证数据集
-    train_size = int(0.8 * len(image_paths))
+    # 划分训练和验证 chunk
+    val_size = int(num_chunks * val_split)
+    train_indices = list(range(num_chunks - val_size))
+    val_indices = list(range(num_chunks - val_size, num_chunks))
     
-    # 打乱数据
-    combined = list(zip(image_paths, scores))
-    random.shuffle(combined)
-    image_paths_shuffled, scores_shuffled = zip(*combined)
-    
-    # 分割数据
-    train_image_paths = image_paths_shuffled[:train_size]
-    train_scores = scores_shuffled[:train_size]
-    val_image_paths = image_paths_shuffled[train_size:]
-    val_scores = scores_shuffled[train_size:]
-    
-    # 创建变换
-    train_transform = create_transforms(augmentations, is_train=True)
-    val_transform = create_transforms(augmentations, is_train=False)
-    
-    train_dataset = ImageScoreDataset(
-        train_image_paths, 
-        train_scores, 
-        transform=train_transform
+    # 创建训练和验证数据加载器
+    train_loader, train_dataset = create_chunk_data_loader(
+        data_folder, batch_size=512, shuffle_samples=False, chunk_indices=train_indices
     )
-    val_dataset = ImageScoreDataset(
-        val_image_paths, 
-        val_scores, 
-        transform=val_transform
+    val_loader, val_dataset = create_chunk_data_loader(
+        data_folder, batch_size=512, shuffle_samples=False, chunk_indices=val_indices
     )
     
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=4, 
-        pin_memory=True
-    )
+    model = MaxVitRegressor()
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Number of trainable parameters: {trainable_params:,}")
     
-    model = MaxVitRegressor().to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=lr, 
+        weight_decay=0.01
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = GradScaler()
     
@@ -328,18 +344,17 @@ def main(root_folder, save_path, augmentations, epochs=50, batch_size=32, lr=1e-
     patience = 5
     counter = 0
     
-    print(f"Training on {device}, dataset size: {len(train_dataset)} train, {len(val_dataset)} val")
-    print(f"Using augmentations: {augmentations}")
+    print(f"Training on {device}")
+    print(f"Train dataset: {len(train_dataset)} chunks, Val dataset: {len(val_dataset)} chunks")
     
     for epoch in range(epochs):
+        print(f"Epoch {epoch+1}/{epochs}")
         model.train()
         train_loss = 0.0
         train_batches = 0
         
-        for images, scores_batch in train_loader:
-            images, scores_batch = images.to(device), scores_batch.to(device)
+        for chunk_idx, (images, scores_batch) in enumerate(train_loader):
             optimizer.zero_grad()
-            
             with autocast():
                 outputs = model(images)
                 loss = criterion(outputs, scores_batch)
@@ -350,18 +365,23 @@ def main(root_folder, save_path, augmentations, epochs=50, batch_size=32, lr=1e-
             
             train_loss += loss.item()
             train_batches += 1
+            
+            print(f"  Chunk {chunk_idx}/{len(train_loader)} - Loss: {loss.item():.4f}")
+            
+            if chunk_idx % 5 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
         
         train_loss /= train_batches if train_batches > 0 else 1
         
-        # 验证 - 不使用autocast
+        # 验证
         model.eval()
         val_loss = 0.0
         val_batches = 0
         
         with torch.no_grad():
             for images, scores_batch in val_loader:
-                images, scores_batch = images.to(device), scores_batch.to(device)
-                outputs = model(images)  # 验证时不使用autocast
+                outputs = model(images)
                 loss = criterion(outputs, scores_batch)
                 val_loss += loss.item()
                 val_batches += 1
@@ -371,7 +391,6 @@ def main(root_folder, save_path, augmentations, epochs=50, batch_size=32, lr=1e-
         
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        # 早停
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             model_path = os.path.join(save_path, 'best_model.pth')
@@ -383,36 +402,27 @@ def main(root_folder, save_path, augmentations, epochs=50, batch_size=32, lr=1e-
             if counter >= patience:
                 print("Early stopping")
                 break
+        
+        gc.collect()
+        torch.cuda.empty_cache()
     
     print(f"Training completed. Best validation loss: {best_val_loss:.4f}")
 
-def parse_augmentations(aug_str):
-    """解析增强参数字符串"""
-    if aug_str is None:
-        return ['resize', 'flip', 'rotation', 'jitter']  # 默认增强
-    return aug_str.lower().split(',')
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train MaxVit model for image scoring')
-    parser.add_argument('--data_folder', type=str, default=r"Images\images to train", help='Root folder containing subfolders with images and scores.json')
+    parser = argparse.ArgumentParser(description='Train MaxVit model for image scoring using chunked preprocessed data')
+    parser.add_argument('--data_folder', type=str, default=r'D:\preprocessed_data', help='Path to preprocessed data folder with chunks')
     parser.add_argument('--save_path', type=str, default=r'maxVit\model', help='Path to save the trained model')
-    parser.add_argument('--augmentations', type=str, default="resize,flip,rotation,jitter,noise", help='Comma-separated list of augmentations to apply: resize,flip,rotation,jitter,noise')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     
     args = parser.parse_args()
     
-    # 解析增强参数
-    augmentations = parse_augmentations(args.augmentations)
     
     try:
-        main(
-            root_folder=args.data_folder,
+        train_model(
+            data_folder=args.data_folder,
             save_path=args.save_path,
-            augmentations=augmentations,
             epochs=args.epochs,
-            batch_size=args.batch_size,
             lr=args.lr
         )
     except Exception as e:

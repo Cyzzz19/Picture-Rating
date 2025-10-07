@@ -49,11 +49,6 @@ def build_exe():
 if __name__ == '__main__':
     print("=== Python脚本打包工具 ===\n")
     
-    # 检查是否需要安装依赖
-    response = input("是否安装依赖包？(y/n): ").lower()
-    if response == 'y':
-        install_requirements()
-    
     # 开始打包
     build_exe()
     
