@@ -166,7 +166,7 @@ class ImageScoreDataset(Dataset):
             image = self.transform(image)
         return image, torch.tensor(score, dtype=torch.float32)
 
-def create_chunk_data_loader(data_folder, batch_size=512, shuffle_samples=False, chunk_indices=None):
+def create_chunk_data_loader(data_folder, batch_size=16, shuffle_samples=False, chunk_indices=None):
     dataset = RandomChunkDataset(
         data_folder, 
         batch_size=batch_size,
@@ -291,10 +291,10 @@ class MaxVitRegressor(nn.Module):
         self.regressor = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(feature_dim, 512),
+            nn.Linear(feature_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),  # 减少过拟合
-            nn.Linear(512, 1)
+            nn.Dropout(0.2),  # 减少过拟合
+            nn.Linear(128, 1)
         ).to(device)  # 确保回归器也在正确的设备上
 
     def forward(self, x):
@@ -302,7 +302,7 @@ class MaxVitRegressor(nn.Module):
         # 应用回归层
         return self.regressor(features).squeeze(1)
 
-def train_model(data_folder, save_path, epochs=50, lr=1e-3, val_split=0.2):
+def train_model(data_folder, save_path, epochs=50, lr=1e-3, val_split=0.15):
     os.makedirs(save_path, exist_ok=True)
     
     if not os.path.exists(data_folder):
@@ -321,10 +321,10 @@ def train_model(data_folder, save_path, epochs=50, lr=1e-3, val_split=0.2):
     
     # 创建训练和验证数据加载器
     train_loader, train_dataset = create_chunk_data_loader(
-        data_folder, batch_size=512, shuffle_samples=False, chunk_indices=train_indices
+        data_folder, batch_size=100, shuffle_samples=False, chunk_indices=train_indices
     )
     val_loader, val_dataset = create_chunk_data_loader(
-        data_folder, batch_size=512, shuffle_samples=False, chunk_indices=val_indices
+        data_folder, batch_size=100, shuffle_samples=False, chunk_indices=val_indices
     )
     
     model = MaxVitRegressor()
